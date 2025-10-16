@@ -226,6 +226,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.forward_context import AFDMetadata
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func

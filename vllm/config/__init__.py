@@ -58,6 +58,8 @@ __all__ = [
     "KVEventsConfig",
     # From vllm.config.kv_transfer
     "KVTransferConfig",
+    # AFD (Attention FFN Disaggregation) configuration
+    "AFDConfig",
     # From vllm.config.load
     "LoadConfig",
     # From vllm.config.lora

@@ -33,6 +33,7 @@ from .observability import ObservabilityConfig
 from .parallel import ParallelConfig
 from .scheduler import SchedulerConfig
 from .speculative import SpeculativeConfig
+from .afd import AFDConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config
 
@@ -100,6 +101,8 @@ class VllmConfig:
     """The configurations for distributed KV cache transfer."""
     kv_events_config: KVEventsConfig | None = None
     """The configurations for event publishing."""
+    afd_config: AFDConfig | None = None
+    """AFD (Attention FFN Disaggregation) configuration."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
@@ -182,6 +185,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.kv_transfer_config:
             vllm_factors.append(self.kv_transfer_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.afd_config:
+            vllm_factors.append(self.afd_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.additional_config:

@@ -68,6 +68,19 @@ from vllm.config.multimodal import MMCacheType, MMEncoderTPMode
 from vllm.config.observability import DetailedTraceModules
 from vllm.config.parallel import DistributedExecutorBackend, ExpertPlacementStrategy
 from vllm.config.scheduler import SchedulerPolicy
+from vllm.config import (AFDConfig, BlockSize, CacheConfig, CacheDType,
+                         CompilationConfig, ConfigType, ConvertOption,
+                         DecodingConfig, DetailedTraceModules, Device,
+                         DeviceConfig, DistributedExecutorBackend, EPLBConfig,
+                         GuidedDecodingBackend, HfOverrides, KVEventsConfig,
+                         KVTransferConfig, LoadConfig, LogprobsMode,
+                         LoRAConfig, MambaDType, MMEncoderTPMode, ModelConfig,
+                         ModelDType, ModelImpl, ObservabilityConfig,
+                         ParallelConfig, PoolerConfig, PrefixCachingHashAlgo,
+                         RunnerOption, SchedulerConfig, SchedulerPolicy,
+                         SpeculativeConfig, TaskOption, TokenizerMode,
+                         VllmConfig, get_attr_docs)
+from vllm.config.multimodal import MMCacheType, MultiModalConfig
 from vllm.config.utils import get_field
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
@@ -528,6 +541,9 @@ class EngineArgs:
     async_scheduling: bool = SchedulerConfig.async_scheduling
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
+
+    # AFD config
+    afd_config: Optional[AFDConfig] = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1040,6 +1056,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
+        vllm_group.add_argument("--afd-config", **vllm_kwargs["afd_config"])
 
         # Other arguments
         parser.add_argument(
@@ -1061,9 +1078,8 @@ class EngineArgs:
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         # Set the attributes from the parsed arguments.
-        engine_args = cls(
-            **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
-        )
+        engine_args_dict = {attr: getattr(args, attr) for attr in attrs}
+        engine_args = cls(**engine_args_dict)
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
@@ -1590,6 +1606,7 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
+            afd_config=self.afd_config,
         )
 
         return config
