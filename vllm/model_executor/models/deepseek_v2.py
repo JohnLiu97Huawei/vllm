@@ -27,7 +27,7 @@
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 from torch import nn
@@ -1107,20 +1107,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             ):
                 self.mlp = DeepseekV2MoE(
                     config=config,
-                    hidden_size=self.hidden_size,
-                    num_heads=config.num_attention_heads,
-                    qk_nope_head_dim=config.qk_nope_head_dim,
-                    qk_rope_head_dim=config.qk_rope_head_dim,
-                    v_head_dim=config.v_head_dim,
-                    q_lora_rank=config.q_lora_rank
-                    if hasattr(config, "q_lora_rank") else None,
-                    kv_lora_rank=config.kv_lora_rank,
-                    rope_theta=rope_theta,
-                    rope_scaling=rope_scaling,
-                    max_position_embeddings=max_position_embeddings,
-                    cache_config=cache_config,
+                    parallel_config=parallel_config,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.self_attn",
+                    prefix=f"{prefix}.mlp",
+                )
+            else:
+                self.mlp = DeepseekV2MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.mlp",
                 )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1135,10 +1132,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
         # Self Attention
-        forward_ctx = get_forward_context()
-        afd_metadata = (forward_ctx.afd_metadata
-                        if forward_ctx is not None else None)
-        afd_connector = afd_metadata.afd_connector
         logger.info(f"attn decode layer :{self.layer_idx}")
         logger.info(f"hidden states type: {type(hidden_states)}")
         if residual is None:
@@ -1313,16 +1306,20 @@ class DeepseekV2Model(nn.Module):
                         if forward_ctx is not None else None)
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            if afd_metadata != None and len(afd_metadata.afd_tokens_start_loc) - 1 > 1:
+            if afd_metadata != None and len(afd_metadata.afd_tokens_start_loc)  > 1:
                 afd_connector = afd_metadata.afd_connector
-                num_stages = len(afd_metadata.afd_tokens_start_loc) - 1
+                num_stages = len(afd_metadata.afd_tokens_start_loc) # - 1
+                logger.info(f"nums_stages: {num_stages}")
+                logger.info(f"start_loc: {afd_metadata.afd_tokens_start_loc}")
                 stage_hidden_states: list[torch.Tensor] = []
                 stage_residual: list[Optional[torch.Tensor]] = []
                 stage_positions: list[torch.Tensor] = []
 
-                for stage_idx in range(num_stages):
+                for stage_idx in range(num_stages): 
+                    logger.info(f"stage_idx:  {stage_idx}")
                     start = afd_metadata.afd_tokens_start_loc[stage_idx]
                     end = start + afd_metadata.afd_tokens_lens[stage_idx]
+                    logger.info(f"start: {start} end: {end}")
                     stage_hidden_states.append(hidden_states[start:end].clone())
                     stage_residual.append(residual[start:end].clone(
                     ) if residual is not None else None)
@@ -1332,8 +1329,10 @@ class DeepseekV2Model(nn.Module):
                     current_hidden = stage_hidden_states[stage_idx]
                     current_residual = stage_residual[stage_idx]
                     current_positions = stage_positions[stage_idx]
+
                     current_hidden, current_residual = \
                         layer(current_positions, current_hidden, current_residual)
+
                     metadata = AFDConnectorMetadata.create_attention_metadata(
                         layer_idx=layer.layer_idx,
                         stage_idx=stage_idx,
