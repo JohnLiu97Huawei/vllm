@@ -43,6 +43,16 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             )
 
         self._counter = 0
+        
+        # Initialize torch.profile for performance monitoring
+        self.profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=30, repeat=2),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=True
+        )
 
         # Initialize CUDA graph support
         self.use_cuda_graph = not self.model_config.enforce_eager
@@ -176,6 +186,9 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
     def _execute_eager_mode(self, hidden_states: torch.Tensor,
                             current_layer_idx: int):
         """Execute FFN computation in eager mode (fallback)."""
+        # Step the profiler for performance monitoring
+        self.profiler.step()
+        
         # Handle TP case: all-gather tensors from all TP ranks
         tp_world_size = get_tensor_model_parallel_world_size()
         if tp_world_size > 1:
