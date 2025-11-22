@@ -24,7 +24,7 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
@@ -162,6 +162,15 @@ class ECConnectorBase(ABC):
         """
         pass
 
+    def wait_for_save(self):
+        """
+        Block until all the save operations are done. This is called
+        as the forward context exits to ensure that the async saving
+        from save_kv_layer is complete before finishing the forward.
+        This prevents overwrites of paged KV buffer before saving done.
+        """
+        return
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
@@ -188,12 +197,14 @@ class ECConnectorBase(ABC):
     def has_caches(
         self,
         request: "Request",
-    ) -> list[bool]:
+        index: Optional[int] = None,
+    ) -> Union[bool, list[bool]]:
         """
         Check if encoder cache exists for each mm data of requests
 
         Args:
             request (Request): the request object.
+            index (Optional[int]) the index of mm data to check.
 
         Returns:
             A list bool where ith value is True if cache exist for

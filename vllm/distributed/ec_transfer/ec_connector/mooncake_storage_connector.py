@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
-
-import safetensors
 
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase, ECConnectorMetadata, ECConnectorRole)
+from vllm.distributed.ec_transfer.ec_lookup_buffer.mooncake_store import (
+    ECMooncakeStore)
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -29,7 +28,7 @@ class MMMeta:
 
 
 @dataclass
-class ECSharedStorageConnectorMetadata(ECConnectorMetadata):
+class ECMooncakeStorageConnectorMetadata(ECConnectorMetadata):
     mm_datas: list[MMMeta]
 
     def __init__(self):
@@ -39,32 +38,22 @@ class ECSharedStorageConnectorMetadata(ECConnectorMetadata):
         self.mm_datas.append(mm_data)
 
 
-class ECSharedStorageConnector(ECConnectorBase):
-    # NOTE: This is Simple debug implementation of the EC connector.
-    # It save / load the EC cache to / from the disk.
+class ECMooncakeStorageConnector(ECConnectorBase):
 
     def __init__(self, vllm_config: "VllmConfig", role: ECConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
-        # req_id -> index
+        # mm_hash -> num_tokens
         self._mm_datas_need_loads: dict[str, int] = {}
-        transfer_config = vllm_config.ec_transfer_config
-        if transfer_config is not None:
-            self._storage_path = transfer_config.get_from_extra_config(
-                "shared_storage_path", "/tmp")
-            logger.debug(transfer_config)
-            logger.debug("Shared storage path is %s", self._storage_path)
-        else:
-            raise ValueError(
-                "ec_transfer_config must be set for ECConnectorBase")
+        self.store = ECMooncakeStore(vllm_config)
 
     def start_load_caches(self, encoder_cache, **kwargs) -> None:
         """
         Start loading the cache from the connector into vLLM's encoder cache.
 
-        This method loads the encoder cache based on metadata provided by the
-        scheduler. It is called before `_gather_mm_embeddings` for the EC
-        Connector. For EC, the `encoder_cache` and `mm_hash` are stored in
-        `kwargs`.
+        This method loads the encoder cache based on metadata
+        provided by the scheduler.It is called before `_gather_mm_embeddings`
+        for the EC Connector. For EC,the `encoder_cache` and `mm_hash`
+        are stored in `kwargs`.
 
         Args:
             encoder_cache (dict[str, torch.Tensor]): A dictionary mapping
@@ -74,24 +63,27 @@ class ECSharedStorageConnector(ECConnectorBase):
 
         # Get the metadata
         metadata: ECConnectorMetadata = self._get_connector_metadata()
-        assert isinstance(metadata, ECSharedStorageConnectorMetadata)
+        assert isinstance(metadata, ECMooncakeStorageConnectorMetadata)
         assert encoder_cache is not None
-        if metadata is None:
+        if not metadata.mm_datas:
             logger.warning((
                 "In connector.start_load_caches, ",
-                "but the connector metadata is None",
+                "but the connector metadata has no mm_datas",
             ))
             return
-        # Load the EC for each mm data
-        for mm_data in metadata.mm_datas:
-            if mm_data.mm_hash in encoder_cache:
-                continue
-            filename = self._generate_filename_debug(mm_data.mm_hash)
-            ec_cache = safetensors.torch.load_file(filename)["ec_cache"].to(
-                self._vllm_config.device_config.device)
-            encoder_cache[mm_data.mm_hash] = ec_cache
-            logger.debug("Success load encoder cache for hash %s",
-                         mm_data.mm_hash)
+
+        mm_hashes = [
+            mm_data.mm_hash for mm_data in metadata.mm_datas
+            if mm_data.mm_hash not in encoder_cache
+        ]
+        device = self._vllm_config.device_config.device
+        tensors = self.store.batch_get(mm_hashes, device)
+
+        for mm_hash, ec_cache in zip(mm_hashes, tensors):
+            encoder_cache[mm_hash] = ec_cache
+            if ec_cache is None:
+                logger.error("Load failed for %s", mm_hash)
+            logger.debug("Load tensor for %s successfully", mm_hash)
 
     def save_caches(self, encoder_cache, mm_hash, **kwargs) -> None:
         """
@@ -107,14 +99,14 @@ class ECSharedStorageConnector(ECConnectorBase):
                 being saved.
             kwargs (dict): Additional keyword arguments for the connector.
         """
-        # Return if it is PD Instance
         if not self.is_producer:
             return
-        filename = self._generate_filename_debug(mm_hash)
-        ec_cache = encoder_cache[mm_hash]
-        tensors = {"ec_cache": ec_cache.detach().cpu()}
-        safetensors.torch.save_file(tensors, filename)
-        logger.debug("Save cache successful for mm_hash %s", mm_hash)
+        assert encoder_cache is not None
+        assert mm_hash is not None
+        self.store.batch_put([mm_hash], [encoder_cache[mm_hash]])
+
+    def wait_for_save(self):
+        self.store.wait_for_put()
 
     def has_caches(
         self,
@@ -132,13 +124,11 @@ class ECSharedStorageConnector(ECConnectorBase):
             List of bool indicate that ith mm_data exist in cache or not
         """
         if index is not None:
-            return self._found_match_for_mm_data(
-                request.mm_features[index].identifier)
+            return self.store.batch_exists(
+                [request.mm_features[index].identifier])[0]
 
-        result = []
-        for feature in request.mm_features:
-            result.append(self._found_match_for_mm_data(feature.identifier))
-        return result
+        mm_hashes = [feature.identifier for feature in request.mm_features]
+        return self.store.batch_exists(mm_hashes)
 
     def update_state_after_alloc(
         self,
@@ -165,43 +155,8 @@ class ECSharedStorageConnector(ECConnectorBase):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
-        meta = ECSharedStorageConnectorMetadata()
+        meta = ECMooncakeStorageConnectorMetadata()
         for mm_hash, num_encoder_token in self._mm_datas_need_loads.items():
             meta.add_mm_data(MMMeta.make_meta(mm_hash, num_encoder_token))
         self._mm_datas_need_loads.clear()
         return meta
-
-    # ==============================
-    # Helper functions
-    # ==============================
-
-    def _found_match_for_mm_data(self, mm_hash) -> bool:
-        """Check if the cache is hit for the request."""
-        filename = self._generate_filename_debug(mm_hash)
-        return os.path.exists(filename)
-
-    def _generate_foldername_debug(
-            self,
-            mm_hash: str,
-            create_folder: bool = True,  # <- now defaults to True
-    ) -> str:
-        """
-        Return the folder in which the cache for this mm_hash lives.
-        If `create_folder` is True (default) the directory is created
-        recursively the first time it is needed.
-        """
-        foldername = os.path.join(self._storage_path, mm_hash)
-        if create_folder:
-            os.makedirs(foldername, exist_ok=True)
-        return foldername
-
-    def _generate_filename_debug(self, mm_hash: str) -> str:
-        """
-        Return the full path of the safetensors file for this mm_hash.
-        Ensures the parent directory exists because
-        `_generate_foldername_debug` is called with its default
-        (`create_folder=True`).
-        """
-        foldername = self._generate_foldername_debug(
-            mm_hash)  # <- folder auto-created
-        return os.path.join(foldername, "encoder_cache.safetensors")
